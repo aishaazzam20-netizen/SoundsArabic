@@ -1,0 +1,1262 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>العربية من الصوت إلى الكلمة | Arabic Sounds & Words</title>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400&family=Noto+Sans+SC:wght@400;500;700&family=Tajawal:wght@400;500;700;800;900&display=swap" rel="stylesheet">
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            arabic: ['Tajawal', 'Amiri', 'sans-serif'],
+            quran: ['Amiri', 'serif'],
+            chinese: ['Noto Sans SC', 'sans-serif']
+          },
+          colors: {
+            brand: {
+              50: '#f0fdf4',
+              100: '#dcfce7',
+              500: '#10b981',
+              600: '#059669',
+              700: '#047857',
+              800: '#065f46',
+              900: '#064e3b'
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- React 18 & Babel -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    body {
+      font-family: 'Tajawal', sans-serif;
+      background-color: #f8fafc;
+      color: #0f172a;
+      user-select: none;
+    }
+    .font-chinese {
+      font-family: 'Noto Sans SC', sans-serif;
+    }
+    .letter-huge {
+      font-size: clamp(6rem, 15vw, 10rem);
+      line-height: 1.1;
+      padding-top: 0.5rem;
+      padding-bottom: 0.5rem;
+    }
+    .word-huge {
+      font-size: clamp(3.8rem, 10vw, 7rem);
+      line-height: 1.25;
+    }
+
+    @keyframes pulse-wave {
+      0%, 100% { transform: scale(1); filter: brightness(1); }
+      50% { transform: scale(1.05); filter: brightness(1.15); }
+    }
+    .audio-playing {
+      animation: pulse-wave 0.8s infinite ease-in-out;
+    }
+
+    .btn-tactile {
+      transition: all 0.15s ease-in-out;
+    }
+    .btn-tactile:active {
+      transform: translateY(2px) scale(0.98);
+      box-shadow: none !important;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    // In-memory audio cache to guarantee instant playback
+    const audioCache = {};
+
+    // Helper: Safely separate Arabic graphemes (letters + attached diacritics)
+    function getArabicGraphemes(str) {
+      if (!str) return [];
+      const graphemes = [];
+      for (let i = 0; i < str.length; i++) {
+        const char = str[i];
+        if (/[\u064B-\u065F\u0670]/.test(char) && graphemes.length > 0) {
+          graphemes[graphemes.length - 1] += char;
+        } else {
+          graphemes.push(char);
+        }
+      }
+      return graphemes;
+    }
+
+    // Convert PCM16 array buffer to WAV Blob
+    function pcmToWav(pcmData, sampleRate = 24000) {
+      const numChannels = 1;
+      const bitsPerSample = 16;
+      const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+      const blockAlign = (numChannels * bitsPerSample) / 8;
+      const dataSize = pcmData.length * 2;
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+
+      const writeString = (v, offset, str) => {
+        for (let i = 0; i < str.length; i++) {
+          v.setUint8(offset + i, str.charCodeAt(i));
+        }
+      };
+
+      writeString(view, 0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeString(view, 8, 'WAVE');
+      writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, bitsPerSample, true);
+      writeString(view, 36, 'data');
+      view.setUint32(40, dataSize, true);
+
+      let offset = 44;
+      for (let i = 0; i < pcmData.length; i++, offset += 2) {
+        view.setInt16(offset, pcmData[i], true);
+      }
+
+      return new Blob([buffer], { type: 'audio/wav' });
+    }
+
+    function base64ToArrayBuffer(base64) {
+      const binaryString = window.atob(base64);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      return bytes.buffer;
+    }
+
+    // Audio Manager
+    let currentAudio = null;
+
+    async function playAudioText(text, promptInstruction = "", onStateChange = () => {}) {
+      if (!text) return;
+
+      // 1. Immediately terminate active audio to prevent overlap or echo
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+        currentAudio = null;
+      }
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+
+      onStateChange(true);
+      const trimmed = text.trim();
+      const cacheKey = promptInstruction ? `${trimmed}_${promptInstruction}` : trimmed;
+
+      // Check cache first
+      if (audioCache[cacheKey]) {
+        try {
+          const audio = new Audio(audioCache[cacheKey]);
+          currentAudio = audio;
+          audio.onended = () => { if (currentAudio === audio) currentAudio = null; onStateChange(false); };
+          audio.onerror = () => { fallbackGoogleTTS(trimmed, cacheKey, onStateChange); };
+          await audio.play();
+          return;
+        } catch (e) {}
+      }
+
+      // Try Gemini 2.5 Flash TTS API
+      try {
+        const apiKey = ""; // Automatic runtime key insertion
+        if (apiKey) {
+          const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+
+          let promptText = "";
+          if (promptInstruction) {
+            promptText = `You are an expert Arabic teacher and Tajweed linguist speaking Modern Standard Arabic. Do NOT say letter names like zhaa or taa or ain under any circumstances. ${promptInstruction}. Pronounce with maximum clarity and exact Mufakhkham/Muraqqaq phonetic contrast: "${trimmed}"`;
+          } else {
+            promptText = `Say clearly in natural Modern Standard Arabic using a clear, warm female teacher voice. Do NOT say letter names. Pronounce ONLY the exact word or short vowel sound: "${trimmed}"`;
+          }
+
+          const payload = {
+            contents: [{ parts: [{ text: promptText }] }],
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: "Sulafat" }
+                }
+              }
+            }
+          };
+
+          const response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+
+          if (response.ok) {
+            const result = await response.json();
+            const part = result?.candidates?.[0]?.content?.parts?.[0];
+            const audioData = part?.inlineData?.data;
+            const mimeType = part?.inlineData?.mimeType;
+
+            if (audioData && mimeType && mimeType.startsWith("audio/")) {
+              const sampleRateMatch = mimeType.match(/rate=(\d+)/);
+              const sampleRate = sampleRateMatch ? parseInt(sampleRateMatch[1], 10) : 24000;
+              const pcmBuffer = base64ToArrayBuffer(audioData);
+              const pcm16 = new Int16Array(pcmBuffer);
+              const wavBlob = pcmToWav(pcm16, sampleRate);
+              const audioUrl = URL.createObjectURL(wavBlob);
+              
+              audioCache[cacheKey] = audioUrl;
+
+              const audio = new Audio(audioUrl);
+              currentAudio = audio;
+              audio.onended = () => { if (currentAudio === audio) currentAudio = null; onStateChange(false); };
+              audio.onerror = () => { fallbackGoogleTTS(trimmed, cacheKey, onStateChange); };
+              await audio.play();
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        // Fallback gracefully on API errors
+      }
+
+      fallbackGoogleTTS(trimmed, cacheKey, onStateChange);
+    }
+
+    async function fallbackGoogleTTS(text, cacheKey, onStateChange) {
+      try {
+        const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=ar&client=tw-ob`;
+        const audio = new Audio(ttsUrl);
+        currentAudio = audio;
+
+        audio.onended = () => { if (currentAudio === audio) currentAudio = null; onStateChange(false); };
+        audio.onerror = () => { speakWithWebSpeech(text, onStateChange); };
+
+        if (cacheKey) {
+          audioCache[cacheKey] = ttsUrl;
+        }
+
+        await audio.play();
+      } catch (err) {
+        speakWithWebSpeech(text, onStateChange);
+      }
+    }
+
+    function speakWithWebSpeech(text, onStateChange) {
+      if (!('speechSynthesis' in window)) {
+        onStateChange(false);
+        return;
+      }
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'ar-SA';
+      utterance.rate = 0.8;
+      utterance.pitch = 1.1;
+      utterance.volume = 1.0;
+
+      const voices = window.speechSynthesis.getVoices();
+      const femaleVoice = voices.find(v => v.lang.startsWith('ar') && 
+        (v.name.toLowerCase().includes('female') || 
+         v.name.toLowerCase().includes('laila') || 
+         v.name.toLowerCase().includes('salma') || 
+         v.name.toLowerCase().includes('marium'))
+      );
+      if (femaleVoice) utterance.voice = femaleVoice;
+
+      let ended = false;
+      const finish = () => {
+        if (!ended) {
+          ended = true;
+          onStateChange(false);
+        }
+      };
+
+      utterance.onend = finish;
+      utterance.onerror = finish;
+      window.speechSynthesis.speak(utterance);
+
+      setTimeout(finish, 1800);
+    }
+
+    const createSvgIcon = (pathD) => ({ className = "w-5 h-5", ...props }) => (
+      <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+        {pathD}
+      </svg>
+    );
+
+    const Volume2 = createSvgIcon(
+      <><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></>
+    );
+    const ArrowRight = createSvgIcon(
+      <><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></>
+    );
+    const ArrowLeft = createSvgIcon(
+      <><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 19"/></>
+    );
+    const Home = createSvgIcon(
+      <><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></>
+    );
+    const CheckCircle2 = createSvgIcon(
+      <><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></>
+    );
+    const Layers = createSvgIcon(
+      <><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></>
+    );
+    const Award = createSvgIcon(
+      <><circle cx="12" cy="8" r="6"/><path d="M15.477 12.89 17 22l-5-3-5 3 1.523-9.11"/></>
+    );
+
+    const ARABIC_DATABASE = [
+      {
+        id: 1, letter: "ا", name: "الأَلِف",
+        sounds: { damma: "أُ", fatha: "أَ", kasra: "إِ" },
+        words: [
+          { position: "initial", word: "أَسَد", target_index: 0, image: "🦁" },
+          { position: "medial", word: "رَأْس", target_index: 1, image: "🗣️" },
+          { position: "final", word: "قَرَأَ", target_index: 2, image: "📖" }
+        ]
+      },
+      {
+        id: 2, letter: "ب", name: "البَاء",
+        sounds: { damma: "بُ", fatha: "بَ", kasra: "بِ" },
+        words: [
+          { position: "initial", word: "بَطَّة", target_index: 0, image: "🦆" },
+          { position: "medial", word: "جَبَل", target_index: 1, image: "⛰️" },
+          { position: "final", word: "بَاب", target_index: 2, image: "🚪" }
+        ]
+      },
+      {
+        id: 3, letter: "ت", name: "التَّاء",
+        sounds: { damma: "تُ", fatha: "تَ", kasra: "تِ" },
+        words: [
+          { position: "initial", word: "تُفَّاح", target_index: 0, image: "🍎" },
+          { position: "medial", word: "دَفْتَر", target_index: 2, image: "📓" },
+          { position: "final", word: "بَنَات", target_index: 3, image: "👭" }
+        ]
+      },
+      {
+        id: 4, letter: "ث", name: "الثَّاء",
+        sounds: { damma: "ثُ", fatha: "ثَ", kasra: "ثِ" },
+        words: [
+          { position: "initial", word: "ثَعْلَب", target_index: 0, image: "🦊" },
+          { position: "medial", word: "مَثَل", target_index: 1, image: "💬" },
+          { position: "final", word: "بَحْث", target_index: 2, image: "🔍" }
+        ]
+      },
+      {
+        id: 5, letter: "ج", name: "الجِيم",
+        sounds: { damma: "جُ", fatha: "جَ", kasra: "جِ" },
+        words: [
+          { position: "initial", word: "جَمَل", target_index: 0, image: "🐫" },
+          { position: "medial", word: "شَجَرَة", target_index: 1, image: "🌳" },
+          { position: "final", word: "ثَلْج", target_index: 2, image: "❄️" }
+        ]
+      },
+      {
+        id: 6, letter: "ح", name: "الحَاء",
+        sounds: { damma: "حُ", fatha: "حَ", kasra: "حِ" },
+        words: [
+          { position: "initial", word: "حِصَان", target_index: 0, image: "🐴" },
+          { position: "medial", word: "بَحْر", target_index: 1, image: "🌊" },
+          { position: "final", word: "تُفَّاح", target_index: 3, image: "🍎" }
+        ]
+      },
+      {
+        id: 7, letter: "خ", name: "الخَاء",
+        sounds: { damma: "خُ", fatha: "خَ", kasra: "خِ" },
+        words: [
+          { position: "initial", word: "خُبْز", target_index: 0, image: "🍞" },
+          { position: "medial", word: "نَخْلَة", target_index: 1, image: "🌴" },
+          { position: "final", word: "طَبْخ", target_index: 2, image: "🍳" }
+        ]
+      },
+      {
+        id: 8, letter: "د", name: "الدَّال",
+        sounds: { damma: "دُ", fatha: "دَ", kasra: "دِ" },
+        words: [
+          { position: "initial", word: "دُبّ", target_index: 0, image: "🐻" },
+          { position: "medial", word: "مَدْرَسَة", target_index: 1, image: "🏫" },
+          { position: "final", word: "وَلَد", target_index: 2, image: "👦" }
+        ]
+      },
+      {
+        id: 9, letter: "ذ", name: "الذَّال",
+        sounds: { damma: "ذُ", fatha: "ذَ", kasra: "ذِ" },
+        words: [
+          { position: "initial", word: "ذُرَة", target_index: 0, image: "🌽" },
+          { position: "medial", word: "جَذْر", target_index: 1, image: "🌱" },
+          { position: "final", word: "لَذِيذ", target_index: 3, image: "😋" }
+        ]
+      },
+      {
+        id: 10, letter: "ر", name: "الرَّاء",
+        sounds: { damma: "رُ", fatha: "رَ", kasra: "رِ" },
+        words: [
+          { position: "initial", word: "رَجُل", target_index: 0, image: "👨" },
+          { position: "medial", word: "جَرَس", target_index: 1, image: "🔔" },
+          { position: "final", word: "نَهْر", target_index: 2, image: "🏞" }
+        ]
+      },
+      {
+        id: 11, letter: "ز", name: "الزَّاي",
+        sounds: { damma: "زُ", fatha: "زَ", kasra: "زِ" },
+        words: [
+          { position: "initial", word: "زَهْرَة", target_index: 0, image: "🌸" },
+          { position: "medial", word: "مَزْرَعَة", target_index: 1, image: "🚜" },
+          { position: "final", word: "مَوْز", target_index: 2, image: "🍌" }
+        ]
+      },
+      {
+        id: 12, letter: "س", name: "السِّين",
+        sounds: { damma: "سُ", fatha: "سَ", kasra: "سِ" },
+        words: [
+          { position: "initial", word: "سَمَكَة", target_index: 0, image: "🐟" },
+          { position: "medial", word: "مَسْجِد", target_index: 1, image: "🕌" },
+          { position: "final", word: "شَمْس", target_index: 2, image: "☀️" }
+        ]
+      },
+      {
+        id: 13, letter: "ش", name: "الشِّين",
+        sounds: { damma: "شُ", fatha: "شَ", kasra: "شِ" },
+        words: [
+          { position: "initial", word: "شَمْس", target_index: 0, image: "☀️" },
+          { position: "medial", word: "مِشْمِش", target_index: 1, image: "🍑" },
+          { position: "final", word: "عُشّ", target_index: 1, image: "🪹" }
+        ]
+      },
+      {
+        id: 14, letter: "ص", name: "الصَّاد",
+        sounds: { damma: "صُ", fatha: "صَ", kasra: "صِ" },
+        words: [
+          { position: "initial", word: "صَقْر", target_index: 0, image: "🦅" },
+          { position: "medial", word: "بَصَل", target_index: 1, image: "🧅" },
+          { position: "final", word: "قَفَص", target_index: 2, image: "🧺" }
+        ]
+      },
+      {
+        id: 15, letter: "ض", name: "الضَّاد",
+        sounds: { damma: "ضُ", fatha: "ضَ", kasra: "ضِ" },
+        words: [
+          { position: "initial", word: "ضَوْء", target_index: 0, image: "💡" },
+          { position: "medial", word: "خُضَار", target_index: 1, image: "🥦" },
+          { position: "final", word: "أَرْض", target_index: 2, image: "🌍" }
+        ]
+      },
+      {
+        id: 16, letter: "ط", name: "الطَّاء",
+        sounds: { damma: "طُ", fatha: "طَ", kasra: "طِ" },
+        words: [
+          { position: "initial", word: "طَائِرَة", target_index: 0, image: "✈️️" },
+          { position: "medial", word: "مَطَر", target_index: 1, image: "🌧️" },
+          { position: "final", word: "خَيْط", target_index: 2, image: "🧵" }
+        ]
+      },
+      {
+        id: 17, letter: "ظ", name: "الظَّاء",
+        sounds: { damma: "ظُ", fatha: "ظَ", kasra: "ظِ" },
+        words: [
+          { position: "initial", word: "ظَرْف", target_index: 0, image: "✉️" },
+          { position: "medial", word: "نَظَّارَة", target_index: 1, image: "👓" },
+          { position: "final", word: "حَفَظَ", target_index: 2, image: "🧠" }
+        ]
+      },
+      {
+        id: 18, letter: "ع", name: "العَيْن",
+        sounds: { damma: "عُ", fatha: "عَ", kasra: "عِ" },
+        words: [
+          { position: "initial", word: "عَيْن", target_index: 0, image: "👁" },
+          { position: "medial", word: "شَمْعَة", target_index: 2, image: "🕯" },
+          { position: "final", word: "إِصْبَع", target_index: 3, image: "🖐️" }
+        ]
+      },
+      {
+        id: 19, letter: "غ", name: "الغَيْن",
+        sounds: { damma: "غُ", fatha: "غَ", kasra: "غِ" },
+        words: [
+          { position: "initial", word: "غَزَال", target_index: 0, image: "🦌" },
+          { position: "medial", word: "صَغِير", target_index: 1, image: "🐣" },
+          { position: "final", word: "صَمْغ", target_index: 2, image: "🧪" }
+        ]
+      },
+      {
+        id: 20, letter: "ف", name: "الفَاء",
+        sounds: { damma: "فُ", fatha: "فَ", kasra: "فِ" },
+        words: [
+          { position: "initial", word: "فِيل", target_index: 0, image: "🐘" },
+          { position: "medial", word: "تُفَّاح", target_index: 1, image: "🍎" },
+          { position: "final", word: "سَيْف", target_index: 2, image: "⚔️" }
+        ]
+      },
+      {
+        id: 21, letter: "ق", name: "القَاف",
+        sounds: { damma: "قُ", fatha: "قَ", kasra: "قِ" },
+        words: [
+          { position: "initial", word: "قَلَم", target_index: 0, image: "✏️" },
+          { position: "medial", word: "بَقَرَة", target_index: 1, image: "🐄" },
+          { position: "final", word: "سُوق", target_index: 2, image: "🛒" }
+        ]
+      },
+      {
+        id: 22, letter: "ك", name: "الكَاْف",
+        sounds: { damma: "كُ", fatha: "كَ", kasra: "كِ" },
+        words: [
+          { position: "initial", word: "كِتَاب", target_index: 0, image: "📚" },
+          { position: "medial", word: "سَمَكَة", target_index: 2, image: "🐟" },
+          { position: "final", word: "دِيك", target_index: 2, image: "🐓" }
+        ]
+      },
+      {
+        id: 23, letter: "ل", name: "اللاَّم",
+        sounds: { damma: "لُ", fatha: "لَ", kasra: "لِ" },
+        words: [
+          { position: "initial", word: "لَيْمُون", target_index: 0, image: "🍋" },
+          { position: "medial", word: "قَلَم", target_index: 1, image: "✏️️" },
+          { position: "final", word: "جَمَل", target_index: 2, image: "🐫" }
+        ]
+      },
+      {
+        id: 24, letter: "م", name: "المِيم",
+        sounds: { damma: "مُ", fatha: "مَ", kasra: "مِ" },
+        words: [
+          { position: "initial", word: "مَاء", target_index: 0, image: "💧" },
+          { position: "medial", word: "قَمَر", target_index: 1, image: "🌙" },
+          { position: "final", word: "قَلَم", target_index: 2, image: "✏️" }
+        ]
+      },
+      {
+        id: 25, letter: "ن", name: "النُّون",
+        sounds: { damma: "نُ", fatha: "نَ", kasra: "نِ" },
+        words: [
+          { position: "initial", word: "نَجْمَة", target_index: 0, image: "⭐" },
+          { position: "medial", word: "عِنَب", target_index: 1, image: "🍇" },
+          { position: "final", word: "عَيْن", target_index: 2, image: "👁️" }
+        ]
+      },
+      {
+        id: 26, letter: "ه", name: "الهَاء",
+        sounds: { damma: "هُ", fatha: "هَ", kasra: "هِ" },
+        words: [
+          { position: "initial", word: "هَرَم", target_index: 0, image: "🔺" },
+          { position: "medial", word: "نَهْر", target_index: 1, image: "🏞" },
+          { position: "final", word: "وَجْه", target_index: 2, image: "😀" }
+        ]
+      },
+      {
+        id: 27, letter: "و", name: "الوَاو",
+        sounds: { damma: "وُ", fatha: "وَ", kasra: "وِ" },
+        words: [
+          { position: "initial", word: "وَرْدَة", target_index: 0, image: "🌹" },
+          { position: "medial", word: "سَبُّورَة", target_index: 2, image: "👩‍🏫" },
+          { position: "final", word: "دَلْو", target_index: 2, image: "🪣" }
+        ]
+      },
+      {
+        id: 28, letter: "ي", name: "اليَاء",
+        sounds: { damma: "يُ", fatha: "يَ", kasra: "يِ" },
+        words: [
+          { position: "initial", word: "يَد", target_index: 0, image: "✋" },
+          { position: "medial", word: "بَيْت", target_index: 1, image: "🏠" },
+          { position: "final", word: "كُرْسِيّ", target_index: 3, image: "🪑" }
+        ]
+      }
+    ];
+
+    // High-precision Minimal Pairs dataset with pristine MSA diacritics
+    const SIMILAR_SOUNDS = [
+      {
+        pair: "س / ص",
+        soundA: "سَ", soundB: "صَ",
+        wordA: "سَيْف", wordB: "صَيْف",
+        desc: "صوت (سَ) مرقق خفيف وصريح - مقابل صوت (صَ) مفخم وعميق",
+        promptSoundA: "Pronounce the short vowel sound 'سَ' thin, light, Muraqqaq.",
+        promptSoundB: "Pronounce the short vowel sound 'صَ' heavy, dark, emphatic Mufakhkham.",
+        promptA: "Pronounce 'سَيْف' with a light, thin, whistling /s/ sound.",
+        promptB: "Exaggerate the deep, heavy, pharyngealized emphatic Mufakhkham /ṣ/ sound in 'صَيْف'. Make it sound thick and deep."
+      },
+      {
+        pair: "ت / ط",
+        soundA: "تَ", soundB: "طَ",
+        wordA: "تِين", wordB: "طِين",
+        desc: "صوت (تَ) خفيف مرقق - مقابل صوت (طَ) مفخم ومستعلٍ",
+        promptSoundA: "Pronounce the short vowel sound 'تَ' thin, light, soft dental t.",
+        promptSoundB: "Pronounce the short vowel sound 'طَ' heavy, emphatic, pharyngealized Ṭa.",
+        promptA: "Pronounce the Arabic word 'تِين' (meaning fig) with a light, soft, thin Muraqqaq /t/ sound (like 'teen').",
+        promptB: "Pronounce the Arabic word 'طِين' (meaning mud) with an extremely heavy, deep, pharyngealized Mufakhkham /ṭ/ sound (Ṭā). Emphasize the deep throat resonance of Ṭā so it is completely distinct from thin 'تِين'."
+      },
+      {
+        pair: "د / ض",
+        soundA: "دَ", soundB: "ضَ",
+        wordA: "دَلَّ", wordB: "ضَلَّ",
+        desc: "صوت (دَ) مرقق خفيف - مقابل صوت (ضَ) مفخم عميق",
+        promptSoundA: "Pronounce the short vowel sound 'دَ' light, thin, Muraqqaq.",
+        promptSoundB: "Pronounce the short vowel sound 'ضَ' heavy, deep, emphatic Mufakhkham.",
+        promptA: "Pronounce 'دَلَّ' with a light, thin Muraqqaq /d/ sound.",
+        promptB: "Pronounce 'ضَلَّ' with an extremely heavy, deep, pharyngealized Mufakhkham /ḍ/ sound (Ḍād)."
+      },
+      {
+        pair: "ذ / ز",
+        soundA: "ذَ", soundB: "زَ",
+        wordA: "ذَلِيل", wordB: "زَلِيل",
+        desc: "صوت (ذَ) إخراج طرف اللسان - مقابل (زَ) صوت صفير",
+        promptSoundA: "Pronounce 'ذَ' interdental with tongue tip between teeth.",
+        promptSoundB: "Pronounce 'زَ' whistling z sound without tongue tip sticking out.",
+        promptA: "Pronounce 'ذَلِيل' with voiced interdental dh sound (tongue tip between teeth).",
+        promptB: "Pronounce 'زَلِيل' with whistling z sound (tongue behind teeth)."
+      },
+      {
+        pair: "ث / س",
+        soundA: "ثَ", soundB: "سَ",
+        wordA: "ثَبَات", wordB: "سَبَات",
+        desc: "صوت (ثَ) إخراج طرف اللسان - مقابل (سَ) صفير خفيف",
+        promptSoundA: "Pronounce 'ثَ' interdental th sound.",
+        promptSoundB: "Pronounce 'سَ' light s whistling sound.",
+        promptA: "Pronounce 'ثَبَات' with voiceless interdental th sound.",
+        promptB: "Pronounce 'سَبَات' with light whistling s sound."
+      },
+      {
+        pair: "ح / ه",
+        soundA: "حَ", soundB: "هَ",
+        wordA: "حَرَم", wordB: "هَرَم",
+        desc: "صوت (حَ) من وسط الحلق - مقابل (هَ) صوت خفيف",
+        promptSoundA: "Pronounce 'حَ' pharyngeal friction from middle throat.",
+        promptSoundB: "Pronounce 'هَ' soft glottal breath.",
+        promptA: "Pronounce 'حَرَم' with strong pharyngeal friction /ḥ/ sound.",
+        promptB: "Pronounce 'هَرَم' with soft glottal /h/ breath."
+      },
+      {
+        pair: "خ / ك",
+        soundA: "خَ", soundB: "كَ",
+        wordA: "خَال", wordB: "كَال",
+        desc: "صوت (خَ) حشرجة الحلق - مقابل (كَ) صوت مرقق",
+        promptA: "Pronounce 'خَال' with uvular friction /kh/ sound.",
+        promptB: "Pronounce 'كَال' with soft front /k/ sound."
+      },
+      {
+        pair: "ع / أ",
+        soundA: "عَ", soundB: "أَ",
+        wordA: "عَلَم", wordB: "أَلَم",
+        desc: "صوت (عَ) انقباض الحلق - مقابل (أَ) همزة خفيفة",
+        promptA: "Pronounce 'عَلَم' with deep pharyngeal Ayn constriction.",
+        promptB: "Pronounce 'أَلَم' with soft Hamza glottal stop."
+      },
+      {
+        pair: "ق / ك",
+        soundA: "قَ", soundB: "كَ",
+        wordA: "قَلْب", wordB: "كَلْب",
+        desc: "صوت (قَ) أقصى الحلق - مقابل (كَ) من وسط الفم",
+        promptA: "Pronounce 'قَلْب' with deep heavy uvular Qaaf /q/.",
+        promptB: "Pronounce 'كَلْب' with front light Kaaf /k/."
+      },
+      {
+        pair: "ر / ل",
+        soundA: "رَ", soundB: "لَ",
+        wordA: "رَبّ", wordB: "لَبّ",
+        desc: "صوت (رَ) تكرير اللسان - مقابل (لَ) صوت ثابت",
+        promptA: "Pronounce 'رَبّ' with clear trilled rolled R sound.",
+        promptB: "Pronounce 'لَبّ' with clear L sound."
+      }
+    ];
+
+    function App() {
+      const [currentTab, setCurrentTab] = useState('home');
+      const [selectedLetterId, setSelectedLetterId] = useState(1);
+      const [pageIndex, setPageIndex] = useState(0);
+      const [isAudioLoading, setIsAudioLoading] = useState(false);
+      const [completedLetters, setCompletedLetters] = useState(() => {
+        try {
+          const saved = localStorage.getItem('arabic_app_progress');
+          return saved ? JSON.parse(saved) : [];
+        } catch (e) { return []; }
+      });
+
+      const playSound = (text, promptInstruction = "") => {
+        playAudioText(text, promptInstruction, setIsAudioLoading);
+      };
+
+      const markLetterCompleted = (id) => {
+        if (!completedLetters.includes(id)) {
+          const updated = [...completedLetters, id];
+          setCompletedLetters(updated);
+          try {
+            localStorage.setItem('arabic_app_progress', JSON.stringify(updated));
+          } catch (e) {}
+        }
+      };
+
+      const currentLetterData = ARABIC_DATABASE.find(item => item.id === selectedLetterId) || ARABIC_DATABASE[0];
+      const progressPercent = Math.round((completedLetters.length / 28) * 100);
+
+      const openLetterUnit = (id) => {
+        setSelectedLetterId(id);
+        setPageIndex(0);
+        setCurrentTab('unit');
+      };
+
+      const handlePrevPage = () => {
+        if (pageIndex > 0) {
+          setPageIndex(pageIndex - 1);
+        } else if (selectedLetterId > 1) {
+          setSelectedLetterId(selectedLetterId - 1);
+          setPageIndex(3);
+        }
+      };
+
+      const handleNextPage = () => {
+        if (pageIndex < 3) {
+          setPageIndex(pageIndex + 1);
+        } else {
+          markLetterCompleted(currentLetterData.id);
+          if (selectedLetterId < 28) {
+            setSelectedLetterId(selectedLetterId + 1);
+            setPageIndex(0);
+          } else {
+            setCurrentTab('home');
+          }
+        }
+      };
+
+      return (
+        <div className="min-h-screen flex flex-col justify-between font-arabic max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5">
+          
+          {/* HEADER CONTROL BAR */}
+          <header className="bg-white rounded-3xl shadow-lg border border-slate-200/80 p-4 mb-6 flex flex-wrap justify-between items-center gap-4">
+            <div className="flex items-center gap-3.5 cursor-pointer" onClick={() => setCurrentTab('home')}>
+              <div className="w-12 h-12 bg-gradient-to-tr from-emerald-600 via-teal-600 to-emerald-500 rounded-2xl flex items-center justify-center text-white font-black text-2xl shadow-md shadow-emerald-600/30">
+                ض
+              </div>
+              <div>
+                <h1 className="text-xl sm:text-2xl font-black text-slate-900 leading-tight tracking-tight">
+                  العربية من الصوت إلى الكلمة
+                </h1>
+                <div className="flex items-center gap-2.5 flex-wrap mt-0.5">
+                  <p className="text-xs font-bold text-emerald-700">Arabic Sounds & Words</p>
+                  <span className="text-xs font-bold text-emerald-900 bg-emerald-50/90 px-3 py-0.5 rounded-full border border-emerald-200/80">
+                    إعداد: أ/ عائشة إبراهيم
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Navigation Tabs Buttons */}
+            <nav className="flex items-center gap-2 overflow-x-auto pb-1 sm:pb-0">
+              <button 
+                onClick={() => setCurrentTab('home')}
+                className={`btn-tactile px-4 py-2.5 rounded-2xl text-xs font-black flex items-center gap-2 transition-all ${currentTab === 'home' ? 'bg-emerald-600 text-white shadow-md' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}
+              >
+                <Home className="w-4 h-4" /> الرئيسية
+              </button>
+              <button 
+                onClick={() => setCurrentTab('contrasts')}
+                className={`btn-tactile px-4 py-2.5 rounded-2xl text-xs font-black flex items-center gap-2 transition-all ${currentTab === 'contrasts' ? 'bg-emerald-600 text-white shadow-md' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}
+              >
+                <Layers className="w-4 h-4" /> تمييز الأصوات
+              </button>
+              <button 
+                onClick={() => setCurrentTab('practice')}
+                className={`btn-tactile px-4 py-2.5 rounded-2xl text-xs font-black flex items-center gap-2 transition-all ${currentTab === 'practice' ? 'bg-amber-500 text-slate-900 shadow-md font-extrabold' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}
+              >
+                <Award className="w-4 h-4" /> الاختبارات
+              </button>
+            </nav>
+          </header>
+
+          {/* PROGRESS BAR */}
+          <div className="bg-white rounded-2xl p-4 mb-6 border border-slate-200/80 shadow-sm flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-emerald-100 flex items-center justify-center text-emerald-800 font-black text-sm">
+                {completedLetters.length}/28
+              </div>
+              <div>
+                <p className="text-xs text-slate-500 font-bold">الحروف المكتملة</p>
+                <p className="text-sm font-black text-slate-800">التقدم الإجمالي: {progressPercent}%</p>
+              </div>
+            </div>
+            <div className="flex-1 max-w-xs bg-slate-100 h-3 rounded-full overflow-hidden border border-slate-200">
+              <div className="bg-gradient-to-r from-emerald-500 to-teal-500 h-full rounded-full transition-all duration-500" style={{ width: `${progressPercent}%` }} />
+            </div>
+          </div>
+
+          <main className="flex-1">
+
+            {/* TAB: HOME */}
+            {currentTab === 'home' && (
+              <div className="space-y-8">
+                
+                {/* Welcome Card with Chinese Subtitle */}
+                <div className="bg-gradient-to-br from-emerald-800 via-teal-800 to-emerald-900 text-white rounded-3xl p-6 sm:p-8 shadow-xl relative overflow-hidden">
+                  <div className="relative z-10 max-w-2xl space-y-3">
+                    <span className="inline-block px-3 py-1 bg-emerald-500/30 border border-emerald-400/40 rounded-full text-xs font-bold text-emerald-200">
+                      برنامج لغوي تفاعلي
+                    </span>
+                    <h2 className="text-2xl sm:text-3xl font-black leading-tight">
+                      مرحبًا بك في رحلة تعلم أصوات اللغة العربية
+                    </h2>
+                    <p className="text-sm sm:text-base font-chinese text-emerald-100 font-bold opacity-90">
+                      欢迎学习阿拉伯语发音与基础单词
+                    </p>
+                    <p className="text-xs sm:text-sm text-slate-200 leading-relaxed font-semibold">
+                      تطبيق تفاعلي شامل لتعلم نطق الحروف العربية الثمانية والعشرين بحركاتها القليلة وكلماتها الملونة.
+                    </p>
+                  </div>
+                </div>
+
+                {/* 28 Letters Grid */}
+                <div>
+                  <div className="flex justify-between items-center mb-6">
+                    <div>
+                      <h3 className="text-2xl font-black text-slate-800">قائمة الحروف العربية (28 وحدة)</h3>
+                      <p className="text-sm text-slate-500 font-semibold">اختر حرفًا للبدء في التعلم مباشرة</p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-4">
+                    {ARABIC_DATABASE.map((item) => {
+                      const isDone = completedLetters.includes(item.id);
+                      return (
+                        <div 
+                          key={item.id}
+                          onClick={() => openLetterUnit(item.id)}
+                          className={`btn-tactile group relative bg-white border-2 rounded-2xl p-4 text-center cursor-pointer transition-all duration-200 hover:-translate-y-1 hover:shadow-lg ${
+                            isDone ? 'border-emerald-400 bg-emerald-50/50' : 'border-slate-200/80 hover:border-emerald-500'
+                          }`}
+                        >
+                          {isDone && (
+                            <div className="absolute top-2 left-2 text-emerald-600">
+                              <CheckCircle2 className="w-5 h-5 fill-emerald-100" />
+                            </div>
+                          )}
+                          <div className="text-4xl font-black text-slate-900 mb-1 group-hover:text-emerald-600 transition-colors">
+                            {item.letter}
+                          </div>
+                          <div className="text-sm font-bold text-slate-700">{item.name}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* TAB: LETTER UNIT READER */}
+            {currentTab === 'unit' && (
+              <div className="bg-white rounded-3xl shadow-sm border border-slate-200/80 p-6 sm:p-10">
+                
+                {/* Header Control Bar */}
+                <div className="flex flex-wrap justify-between items-center gap-4 pb-6 mb-6 border-b border-slate-100">
+                  <div className="flex items-center gap-3">
+                    <button 
+                      onClick={() => setCurrentTab('home')}
+                      className="btn-tactile p-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl border border-slate-200/80 transition-all shadow-sm"
+                      title="العودة للقائمة"
+                    >
+                      <ArrowRight className="w-5 h-5" />
+                    </button>
+                    <div>
+                      <h3 className="text-xl font-black text-slate-900 flex items-center gap-2">
+                        الوحدة {currentLetterData.id}: حرف {currentLetterData.name} ({currentLetterData.letter})
+                      </h3>
+                      <p className="text-xs text-slate-500 font-semibold">
+                        الصفحة {pageIndex + 1} من 4 — {pageIndex === 0 ? "أصوات الحرف بالحركات" : pageIndex === 1 ? "الحرف في أول الكلمة" : pageIndex === 2 ? "الحرف في وسط الكلمة" : "الحرف في آخر الكلمة"}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Top Switcher */}
+                  <div className="flex items-center gap-2 bg-slate-50 p-1.5 rounded-2xl border border-slate-200/80">
+                    <button 
+                      disabled={selectedLetterId === 1 && pageIndex === 0}
+                      onClick={handlePrevPage}
+                      className="btn-tactile px-3.5 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 transition disabled:opacity-40 shadow-sm"
+                    >
+                      السابق
+                    </button>
+                    <span className="text-xs font-black text-slate-600 font-mono px-2">{selectedLetterId} / 28</span>
+                    <button 
+                      disabled={selectedLetterId === 28 && pageIndex === 3}
+                      onClick={handleNextPage}
+                      className="btn-tactile px-3.5 py-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 transition disabled:opacity-40 shadow-sm"
+                    >
+                      التالي
+                    </button>
+                  </div>
+                </div>
+
+                {/* Sub-Page Content */}
+                {pageIndex === 0 && (
+                  /* PAGE 1: LETTER & SHORT VOWELS */
+                  <div className="text-center py-4 space-y-8">
+                    
+                    {/* HUGE LETTER DISPLAY WITH SPEAKER BUTTON BESIDE IT */}
+                    <div className="flex items-center justify-center gap-5 my-6">
+                      <div className="letter-huge font-black text-slate-900 bg-slate-50/80 px-10 py-6 rounded-3xl border-2 border-slate-200 shadow-inner">
+                        {currentLetterData.letter}
+                      </div>
+                      
+                      {/* TACTILE AUDIO SPEAKER BUTTON BESIDE LETTER */}
+                      <button 
+                        onClick={() => playSound(currentLetterData.name, `Say the formal Arabic name of the letter '${currentLetterData.name}' clearly.`)}
+                        className={`btn-tactile bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white p-5 sm:p-6 rounded-2xl shadow-lg shadow-emerald-600/30 border-b-4 border-emerald-800 transition-all flex items-center justify-center ${isAudioLoading ? 'audio-playing' : ''}`}
+                        title="استمع لاسم الحرف"
+                      >
+                        <Volume2 className="w-9 h-9 sm:w-10 sm:h-10" />
+                      </button>
+                    </div>
+
+                    <div>
+                      <h4 className="text-2xl font-black text-slate-800">اسْمُ الحَرْف: {currentLetterData.name}</h4>
+                    </div>
+
+                    <div className="max-w-2xl mx-auto pt-6 border-t border-slate-100">
+                      <h5 className="text-sm font-bold text-slate-600 mb-6">استمع إلى أصوات الحرف بالحركات القصيرة:</h5>
+                      
+                      <div className="grid grid-cols-3 gap-3 sm:gap-6 mb-6">
+                        
+                        {/* DAMMA */}
+                        <div className="bg-amber-50/80 border-2 border-amber-200 rounded-3xl p-4 sm:p-5 text-center shadow-sm hover:shadow-md transition-all flex flex-col justify-between">
+                          <div className="text-xs font-black text-amber-800 mb-2">الضَّمَّة</div>
+                          <div className="text-5xl sm:text-6xl font-black text-slate-900 pt-6 pb-3 my-2 font-quran leading-normal">{currentLetterData.sounds.damma}</div>
+                          <button 
+                            onClick={() => playSound(currentLetterData.sounds.damma, `Pronounce ONLY the short vowel sound '${currentLetterData.sounds.damma}' clearly without saying letter names.`)}
+                            className="btn-tactile w-full py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-white border-b-4 border-amber-700 rounded-xl font-bold flex items-center justify-center gap-2 text-sm shadow-md transition-all"
+                          >
+                            <Volume2 className="w-4 h-4" /> استمع
+                          </button>
+                        </div>
+
+                        {/* FATHA */}
+                        <div className="bg-emerald-50/80 border-2 border-emerald-200 rounded-3xl p-4 sm:p-5 text-center shadow-sm hover:shadow-md transition-all flex flex-col justify-between">
+                          <div className="text-xs font-black text-emerald-800 mb-2">الفَتْحَة</div>
+                          <div className="text-5xl sm:text-6xl font-black text-slate-900 pt-6 pb-3 my-2 font-quran leading-normal">{currentLetterData.sounds.fatha}</div>
+                          <button 
+                            onClick={() => playSound(currentLetterData.sounds.fatha, `Pronounce ONLY the short vowel sound '${currentLetterData.sounds.fatha}' clearly without saying letter names.`)}
+                            className="btn-tactile w-full py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white border-b-4 border-emerald-800 rounded-xl font-bold flex items-center justify-center gap-2 text-sm shadow-md transition-all"
+                          >
+                            <Volume2 className="w-4 h-4" /> استمع
+                          </button>
+                        </div>
+
+                        {/* KASRA */}
+                        <div className="bg-teal-50/80 border-2 border-teal-200 rounded-3xl p-4 sm:p-5 text-center shadow-sm hover:shadow-md transition-all flex flex-col justify-between">
+                          <div className="text-xs font-black text-teal-800 mb-2">الكَسْرَة</div>
+                          <div className="text-5xl sm:text-6xl font-black text-slate-900 pt-6 pb-3 my-2 font-quran leading-normal">{currentLetterData.sounds.kasra}</div>
+                          <button 
+                            onClick={() => playSound(currentLetterData.sounds.kasra, `Pronounce ONLY the short vowel sound '${currentLetterData.sounds.kasra}' clearly without saying letter names.`)}
+                            className="btn-tactile w-full py-2.5 bg-gradient-to-r from-teal-600 to-emerald-700 hover:from-teal-500 hover:to-emerald-600 text-white border-b-4 border-teal-900 rounded-xl font-bold flex items-center justify-center gap-2 text-sm shadow-md transition-all"
+                          >
+                            <Volume2 className="w-4 h-4" /> استمع
+                          </button>
+                        </div>
+
+                      </div>
+
+                      {/* LISTEN TO ALL 3 VOWELS BUTTON */}
+                      <button 
+                        onClick={() => playSound(`${currentLetterData.sounds.damma} ... ${currentLetterData.sounds.fatha} ... ${currentLetterData.sounds.kasra}`, `Pronounce the three short vowel sounds in sequence: ${currentLetterData.sounds.damma}, then ${currentLetterData.sounds.fatha}, then ${currentLetterData.sounds.kasra}.`)}
+                        className="btn-tactile w-full sm:w-auto px-7 py-3.5 bg-slate-900 hover:bg-slate-800 text-white border-b-4 border-black rounded-2xl text-sm font-extrabold inline-flex items-center justify-center gap-2.5 shadow-lg shadow-slate-900/20 transition-all"
+                      >
+                        <Volume2 className="w-5 h-5 text-amber-400" /> استمع إلى الأصوات الثلاثة متتابعة
+                      </button>
+                    </div>
+
+                  </div>
+                )}
+
+                {/* PAGES 2, 3, 4: WORD POSITIONS */}
+                {pageIndex > 0 && (
+                  <div className="text-center py-4 space-y-8 max-w-3xl mx-auto">
+                    
+                    {/* Position Label Banner */}
+                    <div className="inline-block px-6 py-2 bg-gradient-to-r from-emerald-100 to-teal-100 text-emerald-900 border border-emerald-200/80 rounded-full text-sm font-black shadow-sm">
+                      {pageIndex === 1 && "مَوْضِعُ الحَرْف: فِي أَوَّلِ الكَلِمَة"}
+                      {pageIndex === 2 && "مَوْضِعُ الحَرْف: فِي وَسَطِ الكَلِمَة"}
+                      {pageIndex === 3 && "مَوْضِعُ الحَرْف: فِي نِهَايَةِ الكَلِمَة"}
+                    </div>
+
+                    {/* Image & Word Container */}
+                    <div className="bg-slate-50 border-2 border-slate-200/80 rounded-3xl p-8 shadow-inner flex flex-col items-center justify-center gap-6">
+                      
+                      {/* Emoji / Illustration Display */}
+                      <div className="text-8xl p-6 bg-white rounded-3xl shadow-md border border-slate-100">
+                        {currentLetterData.words[pageIndex - 1].image}
+                      </div>
+
+                      {/* Display Word with Target Letter Highlighted while preserving Cursive Joining */}
+                      <div className="word-huge font-black text-slate-800 tracking-wide font-quran py-2">
+                        {getArabicGraphemes(currentLetterData.words[pageIndex - 1].word).map((grapheme, index) => {
+                          const isTarget = index === currentLetterData.words[pageIndex - 1].target_index;
+                          return (
+                            <span 
+                              key={index} 
+                              className={isTarget 
+                                ? "text-rose-600 font-black underline underline-offset-8 decoration-rose-500 decoration-4" 
+                                : "text-slate-900 font-black"
+                              }
+                            >
+                              {grapheme}
+                            </span>
+                          );
+                        })}
+                      </div>
+
+                      {/* TACTILE LISTEN WORD BUTTON */}
+                      <button 
+                        onClick={() => playSound(currentLetterData.words[pageIndex - 1].word, `Pronounce the Arabic word '${currentLetterData.words[pageIndex - 1].word}' with crystal clear Modern Standard Arabic pronunciation.`)}
+                        className="btn-tactile px-8 py-4 bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-600 hover:from-emerald-500 hover:to-teal-500 text-white border-b-4 border-emerald-800 rounded-2xl font-extrabold text-lg flex items-center gap-3 shadow-lg shadow-emerald-600/30 transition-all cursor-pointer"
+                      >
+                        <Volume2 className="w-6 h-6" /> استمع للكلمة
+                      </button>
+
+                    </div>
+
+                  </div>
+                )}
+
+                {/* BOTTOM NAVIGATION CONTROLS */}
+                <div className="flex flex-wrap justify-between items-center gap-4 pt-8 mt-6 border-t border-slate-100">
+                  <button 
+                    disabled={selectedLetterId === 1 && pageIndex === 0}
+                    onClick={handlePrevPage}
+                    className="btn-tactile px-6 py-3 bg-slate-100 hover:bg-slate-200 border-2 border-slate-200/80 text-slate-800 font-extrabold rounded-2xl disabled:opacity-40 flex items-center gap-2 transition-all shadow-sm"
+                  >
+                    <ArrowRight className="w-4 h-4" /> السابق
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    {[0, 1, 2, 3].map(idx => (
+                      <span 
+                        key={idx} 
+                        className={`h-3 rounded-full transition-all duration-300 ${pageIndex === idx ? 'bg-emerald-600 w-8 shadow-sm' : 'bg-slate-200 w-3'}`}
+                      />
+                    ))}
+                  </div>
+
+                  <button 
+                    onClick={handleNextPage}
+                    className="btn-tactile px-7 py-3 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white border-b-4 border-emerald-800 font-extrabold rounded-2xl flex items-center gap-2 shadow-md shadow-emerald-600/25 transition-all"
+                  >
+                    {pageIndex < 3 ? "التالي" : "إكمال الدرس والتالي"} <ArrowLeft className="w-4 h-4" />
+                  </button>
+                </div>
+
+              </div>
+            )}
+
+            {/* TAB: PHONETIC CONTRASTS */}
+            {currentTab === 'contrasts' && (
+              <div className="bg-white rounded-3xl shadow-sm border border-slate-200 p-6 sm:p-8 space-y-6">
+                <div>
+                  <h3 className="text-2xl font-black text-slate-900">التمييز بين الأصوات المتقاربة</h3>
+                  <p className="text-sm text-slate-500 font-semibold mt-1">تدريبات الاستماع والمقارنة الدقيقة بين نطق أصوات الحروف المتقاربة</p>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {SIMILAR_SOUNDS.map((item, idx) => (
+                    <div key={idx} className="bg-slate-50/90 border-2 border-slate-200/80 rounded-3xl p-5 space-y-5 shadow-sm hover:shadow-md transition-all">
+                      <div className="flex justify-between items-center border-b pb-3">
+                        <span className="text-2xl font-black text-emerald-800">{item.pair}</span>
+                        
+                        {/* Play both sounds in sequence */}
+                        <button 
+                          onClick={() => playSound(`${item.soundA} ... ${item.soundB}`, `Pronounce first the light sound ${item.soundA}, pause, then pronounce the heavy or contrasting sound ${item.soundB} distinctly.`)}
+                          className="btn-tactile px-4 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white border-b-2 border-emerald-800 rounded-xl text-xs font-black flex items-center gap-1.5 shadow-sm"
+                        >
+                          <Volume2 className="w-4 h-4 text-amber-300" /> استمع للصوتين متتابعين
+                        </button>
+                      </div>
+
+                      {/* Isolated Short Sound Buttons */}
+                      <div className="grid grid-cols-2 gap-3 text-center">
+                        <button 
+                          onClick={() => playSound(item.soundA, item.promptSoundA || `Pronounce the short sound '${item.soundA}' as a light, non-emphatic, thin Muraqqaq sound in Modern Standard Arabic.`)}
+                          className="btn-tactile p-3.5 bg-emerald-50/80 border-2 border-emerald-200 rounded-2xl hover:bg-emerald-100 transition-all shadow-sm flex items-center justify-between px-4"
+                        >
+                          <span className="text-2xl font-black text-emerald-900 font-quran">{item.soundA}</span>
+                          <div className="flex items-center gap-1 text-xs font-bold text-emerald-700">
+                            <Volume2 className="w-4 h-4" /> الصوت الأول
+                          </div>
+                        </button>
+
+                        <button 
+                          onClick={() => playSound(item.soundB, item.promptSoundB || `Pronounce the short sound '${item.soundB}' as a heavy, emphatic, deep Mufakhkham sound in Modern Standard Arabic.`)}
+                          className="btn-tactile p-3.5 bg-teal-50/80 border-2 border-teal-200 rounded-2xl hover:bg-teal-100 transition-all shadow-sm flex items-center justify-between px-4"
+                        >
+                          <span className="text-2xl font-black text-teal-900 font-quran">{item.soundB}</span>
+                          <div className="flex items-center gap-1 text-xs font-bold text-teal-700">
+                            <Volume2 className="w-4 h-4" /> الصوت الثاني
+                          </div>
+                        </button>
+                      </div>
+
+                      {/* Word Examples Side by Side */}
+                      <div className="grid grid-cols-2 gap-3 text-center">
+                        <button 
+                          onClick={() => playSound(item.wordA, item.promptA || `Pronounce the Arabic word '${item.wordA}' with a light, non-emphatic Muraqqaq initial sound in clear Modern Standard Arabic.`)}
+                          className="btn-tactile p-3.5 bg-white border-2 border-slate-200/80 rounded-2xl hover:bg-emerald-50 hover:border-emerald-300 transition-all shadow-sm"
+                        >
+                          <div className="text-xl font-black text-slate-900">{item.wordA}</div>
+                          <div className="text-xs text-slate-500 font-bold mt-1">مثال الأول</div>
+                        </button>
+                        <button 
+                          onClick={() => playSound(item.wordB, item.promptB || `Pronounce the Arabic word '${item.wordB}' with a distinct heavy, emphatic Mufakhkham initial sound in clear Modern Standard Arabic.`)}
+                          className="btn-tactile p-3.5 bg-white border-2 border-slate-200/80 rounded-2xl hover:bg-emerald-50 hover:border-emerald-300 transition-all shadow-sm"
+                        >
+                          <div className="text-xl font-black text-slate-900">{item.wordB}</div>
+                          <div className="text-xs text-slate-500 font-bold mt-1">مثال الثاني</div>
+                        </button>
+                      </div>
+
+                      <p className="text-xs font-bold text-slate-600 leading-relaxed bg-white/80 p-3 rounded-xl border border-slate-200/60">{item.desc}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* TAB: PRACTICE & QUIZ */}
+            {currentTab === 'practice' && (
+              <QuizModule playSound={playSound} database={ARABIC_DATABASE} />
+            )}
+
+          </main>
+
+          {/* FOOTER */}
+          <footer className="mt-8 text-center text-xs text-slate-400 py-4 border-t border-slate-200 font-bold">
+            <p>العربية من الصوت إلى الكلمة | Arabic Sounds & Words</p>
+          </footer>
+
+        </div>
+      );
+    }
+
+    function QuizModule({ playSound, database }) {
+      const [questionIndex, setQuestionIndex] = useState(0);
+      const [score, setScore] = useState(0);
+      const [selectedAnswer, setSelectedAnswer] = useState(null);
+      const [isCorrect, setIsCorrect] = useState(null);
+
+      // Generate stable options for current randomized question
+      const currentQuestionData = useMemo(() => {
+        const randomIndex = Math.floor(Math.random() * database.length);
+        const targetItem = database[randomIndex];
+
+        const wrongOptions = database
+          .filter(item => item.id !== targetItem.id)
+          .sort(() => 0.5 - Math.random())
+          .slice(0, 3);
+
+        const shuffledOptions = [targetItem, ...wrongOptions].sort(() => 0.5 - Math.random());
+
+        return {
+          targetItem,
+          options: shuffledOptions
+        };
+      }, [questionIndex, database]);
+
+      const { targetItem, options } = currentQuestionData;
+
+      const handleCheck = (optionLetter) => {
+        if (selectedAnswer !== null) return;
+        setSelectedAnswer(optionLetter);
+        if (optionLetter === targetItem.letter) {
+          setIsCorrect(true);
+          setScore(prev => prev + 1);
+        } else {
+          setIsCorrect(false);
+        }
+      };
+
+      const handleNext = () => {
+        setSelectedAnswer(null);
+        setIsCorrect(null);
+        setQuestionIndex(prev => prev + 1);
+      };
+
+      return (
+        <div className="bg-white rounded-3xl shadow-sm border border-slate-200/80 p-6 sm:p-8 max-w-2xl mx-auto text-center space-y-6">
+          <div className="flex justify-between items-center border-b pb-4">
+            <div>
+              <h3 className="text-2xl font-black text-slate-900">اختبار الاستماع</h3>
+              <p className="text-xs text-slate-500 font-bold">استمع لصوت الحرف بالحركة ثم اختر الشكل الصحيح</p>
+            </div>
+            <div className="bg-emerald-100 text-emerald-800 font-black text-sm px-4 py-2 rounded-2xl border border-emerald-200">
+              النتيجة: {score}
+            </div>
+          </div>
+
+          <div className="bg-gradient-to-br from-emerald-50/80 to-teal-50/80 border-2 border-emerald-100 rounded-3xl p-8 space-y-4">
+            <p className="text-sm font-bold text-emerald-900">اضغط على زر السماعة للاستماع لصوت الحرف الأساسي:</p>
+            <button 
+              onClick={() => playSound(targetItem.sounds.fatha, `Pronounce ONLY the short vowel sound '${targetItem.sounds.fatha}' clearly without saying letter names.`)}
+              className="btn-tactile p-6 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white rounded-full shadow-lg shadow-emerald-600/30 border-b-4 border-emerald-800 inline-flex items-center justify-center transition-all cursor-pointer"
+              title="استمع للصوت الأساسي"
+            >
+              <Volume2 className="w-10 h-10" />
+            </button>
+          </div>
+
+          {/* Options Grid - STABLE POSITIONS */}
+          <div className="grid grid-cols-2 gap-4">
+            {options.map((opt) => (
+              <button 
+                key={opt.id}
+                onClick={() => handleCheck(opt.letter)}
+                disabled={selectedAnswer !== null}
+                className={`btn-tactile py-6 text-4xl font-black rounded-2xl border-2 transition-all shadow-sm ${
+                  selectedAnswer === opt.letter 
+                    ? isCorrect ? 'bg-emerald-500 text-white border-emerald-600 shadow-md' : 'bg-rose-500 text-white border-rose-600 shadow-md'
+                    : 'bg-slate-50 hover:bg-slate-100 border-slate-200/80 text-slate-900 hover:border-emerald-400'
+                }`}
+              >
+                {opt.letter}
+              </button>
+            ))}
+          </div>
+
+          {/* Feedback */}
+          {selectedAnswer && (
+            <div className="space-y-4 pt-2">
+              <div className={`p-4 rounded-2xl font-black text-sm ${isCorrect ? 'bg-emerald-100 text-emerald-900 border border-emerald-200' : 'bg-rose-100 text-rose-900 border border-rose-200'}`}>
+                {isCorrect ? 'إجابة صحيحة! أحسنت 👏' : `إجابة خاطئة! الحرف الصحيح هو (${targetItem.letter})`}
+              </div>
+              <button 
+                onClick={handleNext}
+                className="btn-tactile px-8 py-3.5 bg-slate-900 hover:bg-slate-800 text-white font-extrabold border-b-4 border-black rounded-2xl text-sm shadow-md transition-all"
+              >
+                السؤال التالي
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
